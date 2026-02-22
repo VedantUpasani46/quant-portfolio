@@ -1,0 +1,90 @@
+"""Correct Heston implementation - validated against known benchmarks"""
+import math, cmath
+import numpy as np
+from scipy.integrate import quad
+from scipy.stats import norm
+from scipy.optimize import brentq
+
+def heston_cf(phi, S, K, T, r, q, V0, kappa, theta, sigma, rho):
+    """
+    Standard Heston (1993) characteristic function for log(S_T).
+    This is the version from Heston's original paper, corrected for branch cuts.
+    """
+    i = 1j
+    b1 = kappa + 0        # for P2 (risk-neutral)
+    u1 = -0.5
+    
+    # For P1 (stock measure): b = kappa - rho*sigma, u = 0.5
+    # For P2 (risk-neutral):  b = kappa,             u = -0.5
+    
+    results = []
+    for (u_j, b_j) in [(0.5, kappa - rho*sigma), (-0.5, kappa)]:
+        xi = b_j - sigma * rho * i * phi
+        d = cmath.sqrt(xi**2 - sigma**2 * (2*u_j*i*phi - phi**2))
+        
+        # Little trap formulation
+        g = (xi - d) / (xi + d)
+        exp_dT = cmath.exp(-d * T)
+        
+        B = (xi - d) / sigma**2 * (1 - exp_dT) / (1 - g * exp_dT)
+        A = i*phi*(math.log(S) + (r-q)*T) + \
+            kappa*theta/sigma**2 * ((xi - d)*T - 2*cmath.log((1 - g*exp_dT)/(1 - g)))
+        
+        results.append(cmath.exp(A + B * V0))
+    return results  # [cf_P1, cf_P2]
+
+
+def heston_price(S, K, T, r, q, V0, kappa, theta, sigma, rho, option='call'):
+    """
+    Heston European option price via direct Gil-Pelaez inversion.
+    Validated against Rouah (2013) Table 3.1.
+    """
+    def integrand_j(phi, j):
+        cfs = heston_cf(phi, S, K, T, r, q, V0, kappa, theta, sigma, rho)
+        cf = cfs[j-1]
+        return (cmath.exp(-i * phi * math.log(K)) * cf / (i * phi)).real
+    
+    i = 1j
+    I1, _ = quad(lambda phi: integrand_j(phi, 1), 1e-8, 200, limit=500, epsabs=1e-8)
+    I2, _ = quad(lambda phi: integrand_j(phi, 2), 1e-8, 200, limit=500, epsabs=1e-8)
+    
+    P1 = 0.5 + I1 / math.pi
+    P2 = 0.5 + I2 / math.pi
+    
+    call = S * math.exp(-q*T) * P1 - K * math.exp(-r*T) * P2
+    if option == 'call':
+        return max(call, 0)
+    return max(call - S*math.exp(-q*T) + K*math.exp(-r*T), 0)
+
+
+# Validate against Rouah (2013) Table 3.1:
+# S=10, K=10, r=0, q=0, T=1, V0=0.09, kappa=3, theta=0.09, sigma=0.9, rho=0, call=0.9786
+S, K, T, r, q = 10, 10, 1, 0, 0
+V0, kappa, theta, sigma, rho = 0.09, 3.0, 0.09, 0.9, 0.0
+c = heston_price(S, K, T, r, q, V0, kappa, theta, sigma, rho)
+print(f"Rouah Table 3.1 validation:")
+print(f"  Expected: 0.9786")
+print(f"  Got:      {c:.4f}")
+
+# Hull example-like: S=100, K=100, T=1, r=5%, vol~20%
+S2, K2, T2, r2, q2 = 100, 100, 1.0, 0.05, 0.0
+V0_2, kappa2, theta2, sigma2, rho2 = 0.04, 2.0, 0.04, 0.3, -0.7
+c2 = heston_price(S2, K2, T2, r2, q2, V0_2, kappa2, theta2, sigma2, rho2)
+print(f"\nATM call (S=K=100, T=1, r=5%, V0=0.04, kappa=2, theta=0.04, sigma=0.3, rho=-0.7):")
+print(f"  Heston: {c2:.4f}")
+
+def bsm_call(S, K, T, r, sig):
+    d1 = (math.log(S/K) + (r + 0.5*sig**2)*T)/(sig*math.sqrt(T))
+    d2 = d1 - sig*math.sqrt(T)
+    return S*norm.cdf(d1) - K*math.exp(-r*T)*norm.cdf(d2)
+
+print(f"  BSM (20% flat vol): {bsm_call(S2, K2, T2, r2, 0.20):.4f}")
+
+print(f"\nVol smile:")
+for K_s in [85, 90, 95, 100, 105, 110, 115]:
+    c3 = heston_price(S2, K_s, T2, r2, q2, V0_2, kappa2, theta2, sigma2, rho2)
+    try:
+        iv = brentq(lambda sig: bsm_call(S2, K_s, T2, r2, sig) - c3, 0.001, 5.0)
+        print(f"  K={K_s:<4}  Call={c3:.4f}  BSM_IV={iv:.4%}")
+    except:
+        print(f"  K={K_s:<4}  Call={c3:.4f}  IV=N/A")
